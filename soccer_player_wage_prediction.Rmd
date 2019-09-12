@@ -234,7 +234,7 @@ data.frame(truth = small_test$Wage, predicted = test_pred) %>% ggplot(aes(truth,
 Here's the resulting RMSE for both models:
 
 ```{r, results = "asis"}
-data.frame(model = c("linear regression", "random forest"), RMSE = c(lm_rmse, rf_rmse))
+data.frame(model = c("linear regression", "random forest"), RMSE = c(lm_rmse, rf_rmse)) %>% pandoc.table()
 ```
 
 
