@@ -1,0 +1,16 @@
+*.csv
+*.RData
+*.rdb
+*.rdx
+*.rds
+*__packages
+*.Rhistory
+*.DS_Store
+
+# include the csv files
+!data.csv
+!train_data.csv 
+!test_data.csv 
+!test_Wage.csv
+!preformance.csv
+!predictions.csv

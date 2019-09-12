@@ -1,0 +1,318 @@
+---
+title: "Soccer players wage prediciton"
+author: "Iyar Lin"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  github_document:
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = T, warning = F, message = F, cache = F)
+set.seed(1)
+options(scipen = 999)
+
+packages <- c(
+  "tidyverse", # best thing that happend to me
+  "readr",
+  "pander", # pretty table rendering
+  "lubridate", # handle dates
+  "ranger"
+)
+
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(char = packages)
+```
+
+# Intro  
+
+In this task I'll utilize the [FIFA 2019 player attributes](https://www.kaggle.com/karangadiya/fifa19) kaggle dataset to predict player wage.
+
+# Dataset exploration and feature engineering
+
+```{r}
+train <- read.csv("data/train_data.csv")
+test <- read.csv("data/test_data.csv")
+```
+
+Let's look at the target variable distribution:
+
+```{r}
+train %>% ggplot(aes(Wage)) + geom_histogram()
+```
+
+There's a large proportion (`r mean(train$Wage == 0)`) of values that are equal to 0.  
+
+We can see that all 0 wages are associated with missing club value: 
+
+```{r, results = "asis"}
+train %>%
+  mutate(Wage_0 = Wage == 0) %>%
+  group_by(is.na(Club)) %>%
+  summarise(Wage_0_freq = mean(Wage_0)) %>%
+  pandoc.table()
+```
+
+We can thus "predict" in cases where the club is missing that the wage will be 0. I'll thus remove these cases from the training set.
+
+```{r, results = "asis"}
+train <- train %>%
+  filter(Wage != 0) %>%
+  select(-Club)
+```
+
+After running str(train) we do the following obviuos transformations to the data:
+
+```{r}
+train <- train %>%
+  select(-c(X, ID, Name, Photo, Flag, Club.Logo, Joined, Contract.Valid.Until)) %>% # could use joined and Contract.Valid.Until to calculate contract length but given time limitation will drop this
+  mutate(
+    Value = as.numeric(gsub("EURO|M", "", Value)),
+    Jersey.Number = Jersey.Number > 1 & Jersey.Number <= 11, # best players are in the first 11
+    Height = as.numeric(gsub(".+'", "", Height)) + as.numeric(gsub("'.+", "", Height)) * 12, # convert to inches
+    Weight = as.numeric(gsub("lbs", "", Weight)),
+    Release.Clause = as.numeric(gsub("EURO|M", "", Value))
+  )
+```
+
+Looking at the "Load From" column below we see there's very sparse distribution of clubs loaned from:
+
+```{r, results = "asis"}
+train %>%
+  group_by(Loaned.From) %>%
+  summarise(count = n()) %>%
+  group_by(no_of_players_loaned_from_same_club = count) %>%
+  summarise(count = n()) %>%
+  pandoc.table()
+```
+
+I'll thus remove it
+
+```{r}
+train$Loaned.From <- NULL
+```
+
+There's a largre number of variables such as "LM", "RF" etc containing strings of the form: xy + z. 
+
+Let's explore xy, and z for LM:
+
+```{r, results = "asis"}
+LM <- train %>% mutate(xy = gsub("\\+.+", "", LM), z = gsub(".+\\+", "", LM))
+LM %>%
+  group_by(z) %>%
+  summarise(count = n()) %>%
+  arrange(-count) %>%
+  head(10) %>% 
+  pandoc.table(caption = "Feature: LM - z")
+```
+
+Next, the xy portion:
+
+```{r, results = "asis"}
+LM %>%
+  group_by(xy) %>%
+  summarise(count = n()) %>%
+  arrange(-count) %>%
+  head(10) %>%
+  pandoc.table(caption = "Feature: LM - xy")
+```
+
+Let's look at another such feature: 
+
+```{r, results = "asis"}
+LDM <- train %>% mutate(xy = gsub("\\+.+", "", LDM), z = gsub(".+\\+", "", LDM))
+LDM %>%
+  group_by(z) %>%
+  summarise(count = n()) %>%
+  arrange(-count) %>%
+  pandoc.table(caption = "Feature: LDM - z")
+```
+
+```{r, results = "asis"}
+LDM %>%
+  group_by(xy) %>%
+  summarise(count = n()) %>%
+  arrange(-count) %>%
+  head(10) %>%
+  pandoc.table(caption = "Feature: LDM - xy")
+```
+
+We can see that the "z" part is not very informative. We'll just clip the xy part:
+
+```{r}
+train <- bind_cols(train %>%
+  mutate_at(vars(LS:RB), list(~ as.numeric(gsub("\\+.+", "", .)))), 
+  train %>% select(LS:RB) %>% mutate_all(~factor(gsub(".+\\+", "", .))))
+```
+
+From the str(train) we can see that some of the factors have huge number of levels. We'll merge together all factor levels which account for less than 5% of observations.
+
+```{r}
+merge_small_factor_levels <- function(factor_vec, thresh = 0.01) {
+  factor_vec <- as.character(factor_vec)
+  factor_vec_levels <- table(factor_vec)
+  small_levels <- factor_vec_levels[factor_vec_levels < length(factor_vec) * thresh]
+  factor_vec[factor_vec %in% names(small_levels)] <- ".merged"
+  factor_vec <- factor(factor_vec)
+  return(factor_vec)
+}
+
+train <- train %>% mutate_if(is.factor, list(~ merge_small_factor_levels(.)))
+```
+
+# Missing value imputation
+
+Let's look at how many values are missing in the remaining variables:
+
+```{r, results="asis"}
+missing <- train %>%
+  summarise_all(list(~ round(mean(is.na(.)), 3))) %>%
+  gather(variable, missing) %>%
+  arrange(-missing) %>%
+  pandoc.table()
+```
+
+For all features other than Value and Release.Clause I'll just use mean and mode imputation.
+
+We can see that Value and Release.Clause are missing about 60% of the time. We'll generate 2 datasets to which we'll build predictive models: 
+
+1. All columns except Value and Release.Clause  
+1. All columns and all rows that have non missing values of Value and Release.Clause  
+
+On the same occasion I'll also generate a test set to benchmark against the different models.
+
+```{r}
+impute_mode <- function(factor_vec) {
+  factor_vec <- as.character(factor_vec)
+  most_common_level <- names(sort(table(factor_vec), decreasing = T))[1]
+  factor_vec[is.na(factor_vec)] <- most_common_level
+  factor_vec <- factor(factor_vec)
+  return(factor_vec)
+}
+
+train <- train %>%
+  mutate_if(function(x) is.factor(x) | is.logical(x), list(~ impute_mode(.))) %>%
+  mutate_at(which(sapply(., function(x) is.numeric(x) | is.integer(x)) & !names(.) %in% c("Value", "Release.Clause")), list(~ replace(., is.na(.), mean(., na.rm = T))))
+
+train_ind <- sample.int(nrow(train), nrow(train) * 0.8)
+train_1 <- train %>%
+  slice(train_ind) %>%
+  select(-c(Value, Release.Clause))
+train_2 <- train %>%
+  slice(train_ind) %>%
+  filter(!is.na(Value) & !is.na(Release.Clause))
+small_test <- train %>% slice(-train_ind)
+```
+
+For ease of use I'll check different models just looking at the first train set, and will apply the winning model to the second train set.
+
+# Try different models
+
+## Regression
+
+```{r}
+RMSE <- function(y, y_hat) sqrt(mean((y - y_hat)^2))
+lm_model <- lm(Wage ~ ., data = train_1)
+test_pred <- predict(lm_model, newdata = small_test)
+
+lm_rmse <- RMSE(small_test$Wage, test_pred)
+
+data.frame(truth = small_test$Wage, predicted = test_pred) %>% ggplot(aes(truth, predicted)) + geom_point() + geom_abline(slope = 1, intercept = 0)
+```
+
+## Random forest
+
+```{r}
+rf_model <- ranger(Wage ~ ., data = train_1)
+test_pred <- predict(rf_model, data = small_test)$predictions
+
+rf_rmse <- RMSE(small_test$Wage, test_pred)
+data.frame(truth = small_test$Wage, predicted = test_pred) %>% ggplot(aes(truth, predicted)) + geom_point() + geom_abline(slope = 1, intercept = 0)
+```
+
+Here's the resulting RMSE for both models:
+
+```{r, results = "asis"}
+data.frame(model = c("linear regression", "random forest"), RMSE = c(lm_rmse, rf_rmse))
+```
+
+
+# Final submission
+
+we'll use the random forest model.
+
+```{r}
+mode <- function(factor_vec) {
+  factor_vec <- as.character(factor_vec)
+  most_common_level <- names(sort(table(factor_vec), decreasing = T))[1]
+  return(most_common_level)
+}
+
+factor_modes <- train %>%
+  select_if(function(x) is.factor(x) | is.logical(x)) %>%
+  summarise_all(list(~ mode(.))) %>%
+  gather(variable, value)
+
+numeric_means <- train %>%
+  select(-c(Value, Release.Clause, Wage)) %>%
+  select_if(function(x) is.numeric(x) | is.logical(x)) %>%
+  summarise_all(mean, na.rm = T) %>%
+  gather(variable, value)
+
+test <- test %>%
+  mutate(
+    Value = as.numeric(gsub("EURO|M", "", Value)),
+    Jersey.Number = Jersey.Number > 1 & Jersey.Number <= 11, # best players are in the first 11
+    Height = as.numeric(gsub(".+'", "", Height)) + as.numeric(gsub("'.+", "", Height)) * 12, # convert to inches
+    Weight = as.numeric(gsub("lbs", "", Weight)),
+    Release.Clause = as.numeric(gsub("EURO|M", "", Value))
+  )
+
+test <- bind_cols(test %>% mutate_at(vars(LS:RB), list(~ as.numeric(gsub("\\+.+", "", .)))), 
+                  test %>% select(LS:RB) %>% mutate_all(~factor(gsub(".+\\+", "", .))))
+  
+for (var in numeric_means$variable) {
+  variable <- test[[var]]
+  variable[is.na(variable)] <- numeric_means$value[numeric_means$variable == var]
+  test[[var]] <- variable
+}
+
+for (var in factor_modes$variable) {
+  variable <- test[[var]]
+  variable <- as.character(variable)
+  variable[is.na(variable)] <- factor_modes$value[factor_modes$variable == var]
+  variable <- factor(variable, levels = levels(train[[var]]))
+  variable[is.na(variable)] <- ".merged"
+  test[[var]] <- variable
+}
+
+train_1 <- train %>% select(-c(Value, Release.Clause))
+train_2 <- train %>% filter(!is.na(Value) & !is.na(Release.Clause))
+
+model_1 <- ranger(Wage ~ ., data = train_1)
+model_2 <- ranger(Wage ~ ., data = train_2)
+
+test_pred <- rep(NA, nrow(test))
+test_pred[is.na(test$Club)] <- 0
+
+pred_1 <- predict(model_1, data = test %>% filter((is.na(Value) | is.na(Release.Clause)) & !is.na(Club)))$predictions
+pred_2 <- predict(model_2, data = test %>% filter((!is.na(Value) & !is.na(Release.Clause)) & !is.na(Club)))$predictions
+test_pred[(is.na(test$Value) | is.na(test$Release.Clause)) & !is.na(test$Club)] <- pred_1
+test_pred[(!is.na(test$Value) & !is.na(test$Release.Clause)) & !is.na(test$Club)] <- pred_2
+```
+
+# Actual performance on test set
+
+```{r}
+test_Wage <- read.csv("data/test_Wage.csv")[, 1]
+rmse_true <- RMSE(test_Wage, test_pred)
+
+data.frame(truth = test_Wage, predicted = test_pred) %>% ggplot(aes(truth, predicted)) + geom_point() + geom_abline(slope = 1, intercept = 0)
+```
+
+The performance on the test is:
+
+```{r, results = "asis"}
+data.frame(metric = c("RMSE", "R^2"), value = c(rmse_true, 1 - var(test_Wage - test_pred) / var(test_Wage))) %>% pandoc.table(caption = "Performance on test set")
+```
